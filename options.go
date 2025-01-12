@@ -5,7 +5,8 @@ type Option interface {
 }
 
 type fsOption struct {
-	openHook func(path string, existingContent []byte, origErr error) ([]byte, error)
+	openHook   func(path string, existingContent []byte, origErr error) ([]byte, error)
+	maxStorage int64
 }
 
 type openHookOption struct {
@@ -30,5 +31,20 @@ func (o *openHookOption) setOption(fsOpt *fsOption) {
 func WithOpenHook(f func(string, []byte, error) ([]byte, error)) Option {
 	return &openHookOption{
 		hook: f,
+	}
+}
+
+type maxStorageOption struct {
+	size int64
+}
+
+func (o *maxStorageOption) setOption(fsOpt *fsOption) {
+	fsOpt.maxStorage = o.size
+}
+
+// WithMaxStorage returns an Option that sets the maximum storage space for the MemFS.
+func WithMaxStorage(size int64) Option {
+	return &maxStorageOption{
+		size: size,
 	}
 }

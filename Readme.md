@@ -4,7 +4,7 @@ memfs is an in-memory implementation of Go's io/fs.FS interface.
 The goal is to make it easy and quick to build an fs.FS filesystem
 when you don't have any complex requirements.
 
-Documentation: https://pkg.go.dev/github.com/psanford/memfs
+Documentation: https://pkg.go.dev/github.com/boomhut/memfs
 
 `io/fs` docs: https://tip.golang.org/pkg/io/fs/
 
@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"io/fs"
 
-	"github.com/psanford/memfs"
+	"github.com/boomhut/memfs"
 )
 
 func main() {
@@ -46,5 +46,18 @@ func main() {
 		panic(err)
 	}
 	fmt.Printf("%s\n", content)
+
+	// Example saving FS to file
+	err = rootFS.SaveToFile(tmpfile.Name())
+	if err != nil {
+		panic(err)
+	}
+
+	// Load the filesystem back
+	loadedFS, err := LoadFromFile(tmpfile.Name())
+	if err != nil {
+		panic(err)
+	}
+
 }
 ```

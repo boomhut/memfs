@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"testing"
 	"testing/fstest"
 
@@ -217,5 +218,115 @@ func TestSeek(t *testing.T) {
 	}
 	if diff := cmp.Diff(bs, []byte("012")); diff != "" {
 		t.Fatalf("read mismatch %s", diff)
+	}
+}
+
+func TestMaxStorage(t *testing.T) {
+	rootFS := New(WithMaxStorage(10)) // Set max storage to 10 bytes
+
+	err := rootFS.WriteFile("file1.txt", []byte("12345"), 0o777)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	err = rootFS.WriteFile("file2.txt", []byte("67890"), 0o777)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+
+	err = rootFS.WriteFile("file3.txt", []byte("exceed"), 0o777)
+	if err == nil {
+		t.Fatal("expected error due to exceeding max storage limit, but got none")
+	}
+	if !errors.Is(err, fs.ErrInvalid) {
+		t.Fatalf("expected fs.ErrInvalid, but got: %v", err)
+	}
+}
+
+func TestSaveLoad(t *testing.T) {
+	// Create a test filesystem with some content
+	rootFS := New()
+
+	// Create directories and files
+	if err := rootFS.MkdirAll("foo/bar", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	testFiles := map[string][]byte{
+		"foo/file1.txt":     []byte("content1"),
+		"foo/bar/file2.txt": []byte("content2"),
+		"root.txt":          []byte("root content"),
+	}
+
+	for path, content := range testFiles {
+		if err := rootFS.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Save the filesystem to a temporary file
+	tmpfile, err := os.CreateTemp("", "memfs_test_*.gob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if err := rootFS.SaveToFile(tmpfile.Name()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load the filesystem back
+	loadedFS, err := LoadFromFile(tmpfile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the loaded filesystem has the same content
+	err = fs.WalkDir(loadedFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip root directory
+		if path == "." {
+			return nil
+		}
+
+		// For files, verify content matches
+		if !d.IsDir() {
+			expectedContent, exists := testFiles[path]
+			if !exists {
+				return fmt.Errorf("unexpected file in loaded fs: %s", path)
+			}
+
+			gotContent, err := fs.ReadFile(loadedFS, path)
+			if err != nil {
+				return fmt.Errorf("reading file %s: %w", path, err)
+			}
+
+			if diff := cmp.Diff(expectedContent, gotContent); diff != "" {
+				return fmt.Errorf("content mismatch for %s: %s", path, diff)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify we can still write to the loaded filesystem
+	newContent := []byte("new file")
+	if err := loadedFS.WriteFile("foo/bar/new.txt", newContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the new file exists and has correct content
+	gotContent, err := fs.ReadFile(loadedFS, "foo/bar/new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(newContent, gotContent); diff != "" {
+		t.Fatalf("new file content mismatch: %s", diff)
 	}
 }

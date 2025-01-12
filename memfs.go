@@ -2,6 +2,7 @@ package memfs
 
 import (
 	"bytes"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -16,8 +17,11 @@ import (
 // FS is an in-memory filesystem that implements
 // io/fs.FS
 type FS struct {
-	dir      *dir
-	openHook func(path string, existingContent []byte, origErr error) ([]byte, error)
+	dir         *Dir
+	openHook    func(path string, existingContent []byte, origErr error) ([]byte, error)
+	maxStorage  int64      // maximum storage limit in bytes
+	usedStorage int64      // current storage usage in bytes
+	mu          sync.Mutex // mutex for storage tracking
 }
 
 // New creates a new in-memory FileSystem.
@@ -27,12 +31,14 @@ func New(opts ...Option) *FS {
 		opt.setOption(&fsOpt)
 	}
 	fs := FS{
-		dir: &dir{
-			children: make(map[string]childI),
+		dir: &Dir{
+			Children: make(map[string]childI),
 		},
+		maxStorage: -1, // -1 means unlimited
 	}
 
 	fs.openHook = fsOpt.openHook
+	fs.maxStorage = fsOpt.maxStorage
 
 	return &fs
 }
@@ -60,17 +66,17 @@ func (rootFS *FS) MkdirAll(path string, perm os.FileMode) error {
 	for _, part := range parts {
 		cur := next
 		cur.mu.Lock()
-		child := cur.children[part]
+		child := cur.Children[part]
 		if child == nil {
-			newDir := &dir{
-				name:     part,
-				perm:     perm,
-				children: make(map[string]childI),
+			newDir := &Dir{
+				Name:     part,
+				Perm:     perm,
+				Children: make(map[string]childI),
 			}
-			cur.children[part] = newDir
+			cur.Children[part] = newDir
 			next = newDir
 		} else {
-			childDir, ok := child.(*dir)
+			childDir, ok := child.(*Dir)
 			if !ok {
 				return fmt.Errorf("not a directory: %s: %w", part, fs.ErrInvalid)
 			}
@@ -82,7 +88,7 @@ func (rootFS *FS) MkdirAll(path string, perm os.FileMode) error {
 	return nil
 }
 
-func (rootFS *FS) getDir(path string) (*dir, error) {
+func (rootFS *FS) getDir(path string) (*Dir, error) {
 	if path == "" {
 		return rootFS.dir, nil
 	}
@@ -93,11 +99,11 @@ func (rootFS *FS) getDir(path string) (*dir, error) {
 		err := func() error {
 			cur.mu.Lock()
 			defer cur.mu.Unlock()
-			child := cur.children[part]
+			child := cur.Children[part]
 			if child == nil {
 				return fmt.Errorf("not a directory: %s: %w", part, fs.ErrNotExist)
 			} else {
-				childDir, ok := child.(*dir)
+				childDir, ok := child.(*Dir)
 				if !ok {
 					return fmt.Errorf("no such file or directory: %s: %w", part, fs.ErrNotExist)
 				}
@@ -130,7 +136,7 @@ func (rootFS *FS) get(path string) (childI, error) {
 		chld, err = func() (childI, error) {
 			cur.mu.Lock()
 			defer cur.mu.Unlock()
-			child := cur.children[part]
+			child := cur.Children[part]
 			if child == nil {
 				return nil, fmt.Errorf("not a directory: %s: %w", part, fs.ErrNotExist)
 			} else {
@@ -143,7 +149,7 @@ func (rootFS *FS) get(path string) (childI, error) {
 					}
 				}
 
-				childDir, ok := child.(*dir)
+				childDir, ok := child.(*Dir)
 				if !ok {
 					return nil, errors.New("not a directory")
 				}
@@ -179,7 +185,7 @@ func (rootFS *FS) create(path string) (*File, error) {
 
 	dir.mu.Lock()
 	defer dir.mu.Unlock()
-	existing := dir.children[filePart]
+	existing := dir.Children[filePart]
 	if existing != nil {
 		_, ok := existing.(*File)
 		if !ok {
@@ -188,10 +194,10 @@ func (rootFS *FS) create(path string) (*File, error) {
 	}
 
 	newFile := &File{
-		name: filePart,
-		perm: 0666,
+		Name: filePart,
+		Perm: 0666,
 	}
-	dir.children[filePart] = newFile
+	dir.Children[filePart] = newFile
 
 	return newFile, nil
 }
@@ -204,6 +210,16 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("invalid path: %s: %w", path, fs.ErrInvalid)
 	}
 
+	rootFS.mu.Lock()
+	if rootFS.maxStorage > 0 {
+		newSize := rootFS.usedStorage + int64(len(data))
+		if newSize > rootFS.maxStorage {
+			rootFS.mu.Unlock()
+			return fmt.Errorf("storage limit exceeded: %w", fs.ErrInvalid)
+		}
+	}
+	rootFS.mu.Unlock()
+
 	if path == "." {
 		// root dir
 		path = ""
@@ -213,8 +229,17 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 	if err != nil {
 		return err
 	}
-	f.content = data
-	f.perm = perm
+
+	rootFS.mu.Lock()
+	if rootFS.maxStorage > 0 {
+		// Subtract old file size and add new file size
+		rootFS.usedStorage -= int64(len(f.Content))
+		rootFS.usedStorage += int64(len(data))
+	}
+	rootFS.mu.Unlock()
+
+	f.Content = data
+	f.Perm = perm
 	return nil
 }
 
@@ -246,7 +271,7 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 				return nil, err
 			}
 			f := child.(*File)
-			f.content = newContent
+			f.Content = newContent
 			f.reader = bytes.NewReader(newContent)
 			return f, nil
 		}
@@ -268,13 +293,14 @@ func (rootFS *FS) open(name string) (fs.File, error) {
 	switch cc := child.(type) {
 	case *File:
 		handle := &File{
-			name:    cc.name,
-			perm:    cc.perm,
-			content: cc.content,
-			reader:  bytes.NewReader(cc.content),
+			Name:    cc.Name,
+			Perm:    cc.Perm,
+			Content: cc.Content,
+			reader:  bytes.NewReader(cc.Content),
+			ModTime: cc.ModTime,
 		}
 		return handle, nil
-	case *dir:
+	case *Dir:
 		handle := &fhDir{
 			dir: cc,
 		}
@@ -293,25 +319,90 @@ func (rootFS *FS) Sub(path string) (fs.FS, error) {
 	return &FS{dir: dir}, nil
 }
 
-type dir struct {
-	mu       sync.Mutex
-	name     string
-	perm     os.FileMode
-	modTime  time.Time
-	children map[string]childI
+// SaveToFile saves the entire filesystem structure to a GOB encoded file
+func (rootFS *FS) SaveToFile(filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return rootFS.SaveTo(f)
+}
+
+// SaveTo saves the filesystem structure to any io.Writer in GOB format
+func (rootFS *FS) SaveTo(w io.Writer) error {
+	encoder := gob.NewEncoder(w)
+	return encoder.Encode(rootFS.dir)
+}
+
+// init registers types for GOB encoding/decoding
+func init() {
+	gob.Register(&Dir{})
+	gob.Register(&File{})
+}
+
+// LoadFromFile creates a new FS by loading from a GOB encoded file
+func LoadFromFile(filename string) (*FS, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return LoadFrom(f)
+}
+
+// LoadFrom creates a new FS by loading from a GOB encoded reader
+func LoadFrom(r io.Reader) (*FS, error) {
+	var rootDir Dir
+	decoder := gob.NewDecoder(r)
+	if err := decoder.Decode(&rootDir); err != nil {
+		return nil, err
+	}
+
+	// Initialize mutexes after loading
+	rootDir.initDir()
+
+	// Create new FS with loaded directory structure
+	fs := &FS{
+		dir:        &rootDir,
+		maxStorage: -1, // Default to unlimited
+	}
+
+	return fs, nil
+}
+
+// Dir represents a directory in the filesystem
+type Dir struct {
+	mu       sync.Mutex `json:"-"` // Unexported, won't be serialized
+	Name     string
+	Perm     os.FileMode
+	ModTime  time.Time
+	Children map[string]childI
+}
+
+// initDir initializes a directory after loading
+func (d *Dir) initDir() {
+	// Initialize children directories recursively
+	for _, child := range d.Children {
+		if dir, ok := child.(*Dir); ok {
+			dir.initDir()
+		}
+	}
 }
 
 type fhDir struct {
-	dir *dir
+	dir *Dir
 	idx int
 }
 
 func (d *fhDir) Stat() (fs.FileInfo, error) {
 	fi := fileInfo{
-		name:    d.dir.name,
+		name:    d.dir.Name,
 		size:    4096,
-		modTime: d.dir.modTime,
-		mode:    d.dir.perm | fs.ModeDir,
+		modTime: d.dir.ModTime,
+		mode:    d.dir.Perm | fs.ModeDir,
 	}
 	return &fi, nil
 }
@@ -328,8 +419,8 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 	d.dir.mu.Lock()
 	defer d.dir.mu.Unlock()
 
-	names := make([]string, 0, len(d.dir.children))
-	for name := range d.dir.children {
+	names := make([]string, 0, len(d.dir.Children))
+	for name := range d.dir.Children {
 		names = append(names, name)
 	}
 
@@ -355,7 +446,7 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 
 	for i := d.idx; i < n && i < len(names); i++ {
 		name := names[i]
-		child := d.dir.children[name]
+		child := d.dir.Children[name]
 
 		f, isFile := child.(*File)
 		if isFile {
@@ -364,12 +455,12 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 				info: stat,
 			})
 		} else {
-			d := child.(*dir)
+			d := child.(*Dir)
 			fi := fileInfo{
-				name:    d.name,
+				name:    d.Name,
 				size:    4096,
-				modTime: d.modTime,
-				mode:    d.perm | fs.ModeDir,
+				modTime: d.ModTime,
+				mode:    d.Perm | fs.ModeDir,
 			}
 			out = append(out, &dirEntry{
 				info: &fi,
@@ -383,12 +474,12 @@ func (d *fhDir) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 type File struct {
-	name    string
-	perm    os.FileMode
-	content []byte
-	reader  *bytes.Reader
-	modTime time.Time
-	closed  bool
+	Name    string
+	Perm    os.FileMode
+	Content []byte
+	reader  *bytes.Reader `json:"-"` // Unexported, won't be serialized
+	ModTime time.Time
+	closed  bool `json:"-"` // Unexported, won't be serialized
 }
 
 func (f *File) Stat() (fs.FileInfo, error) {
@@ -396,10 +487,10 @@ func (f *File) Stat() (fs.FileInfo, error) {
 		return nil, fs.ErrClosed
 	}
 	fi := fileInfo{
-		name:    f.name,
-		size:    int64(len(f.content)),
-		modTime: f.modTime,
-		mode:    f.perm,
+		name:    f.Name,
+		size:    int64(len(f.Content)),
+		modTime: f.ModTime,
+		mode:    f.Perm,
 	}
 	return &fi, nil
 }
