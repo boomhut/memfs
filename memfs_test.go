@@ -330,3 +330,145 @@ func TestSaveLoad(t *testing.T) {
 		t.Fatalf("new file content mismatch: %s", diff)
 	}
 }
+
+// TestSeekWithClosedFile tests that seeking on a closed file returns an error.
+func TestSeekWithClosedFile(t *testing.T) {
+	rootFS := New()
+
+	err := rootFS.WriteFile("foo", []byte("0123456789"), 0o777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := rootFS.Open("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seeker, ok := f.(io.Seeker)
+	if !ok {
+		t.Fatalf("File does not implement io.Seeker")
+	}
+
+	_, err = seeker.Seek(0, io.SeekStart)
+	if err == nil {
+		t.Fatalf("Expected error when seeking on a closed file, got none")
+	}
+}
+
+// TestReadWithClosedFile tests that reading from a closed file returns an error.
+func TestReadWithClosedFile(t *testing.T) {
+	rootFS := New()
+
+	err := rootFS.WriteFile("foo", []byte("0123456789"), 0o777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := rootFS.Open("foo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.Read(make([]byte, 1))
+	if err == nil {
+		t.Fatalf("Expected error when reading from a closed file, got none")
+	}
+}
+
+// TestCompressedSaveLoad tests saving and loading a compressed filesystem.
+func TestCompressedSaveLoad(t *testing.T) {
+	// Create a test filesystem with some content
+	rootFS := New()
+
+	// Create directories and files
+	if err := rootFS.MkdirAll("foo/bar", 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	testFiles := map[string][]byte{
+		"foo/file1.txt":     []byte("content1"),
+		"foo/bar/file2.txt": []byte("content2"),
+		"root.txt":          []byte("root content"),
+	}
+
+	for path, content := range testFiles {
+		if err := rootFS.WriteFile(path, content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Save the filesystem to a temporary file
+	tmpfile, err := os.CreateTemp("", "memfs_test_*.gob")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(tmpfile.Name())
+
+	if err := rootFS.CompressAndSaveToFile(tmpfile.Name()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load the filesystem back
+	loadedFS, err := DecompressAndLoadFromFile(tmpfile.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the loaded filesystem has the same content
+	err = fs.WalkDir(loadedFS, ".", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip root directory
+		if path == "." {
+			return nil
+		}
+
+		// For files, verify content matches
+		if !d.IsDir() {
+			expectedContent, exists := testFiles[path]
+			if !exists {
+				return fmt.Errorf("unexpected file in loaded fs: %s", path)
+			}
+
+			gotContent, err := fs.ReadFile(loadedFS, path)
+			if err != nil {
+				return fmt.Errorf("reading file %s: %w", path, err)
+			}
+
+			if diff := cmp.Diff(expectedContent, gotContent); diff != "" {
+				return fmt.Errorf("content mismatch for %s: %s", path, diff)
+			}
+		}
+
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify we can still write to the loaded filesystem
+	newContent := []byte("new file")
+	if err := loadedFS.WriteFile("foo/bar/new.txt", newContent, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the new file exists and has correct content
+	gotContent, err := fs.ReadFile(loadedFS, "foo/bar/new.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if diff := cmp.Diff(newContent, gotContent); diff != "" {
+		t.Fatalf("new file content mismatch: %s", diff)
+	}
+}

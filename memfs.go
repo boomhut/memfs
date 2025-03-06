@@ -2,6 +2,7 @@ package memfs
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -24,7 +25,8 @@ type FS struct {
 	mu          sync.Mutex // mutex for storage tracking
 }
 
-// New creates a new in-memory FileSystem.
+// New creates a new in-memory FileSystem. It accepts options to customize the filesystem. The options are: openHook and maxStorage.
+// Set like this: memfs.New(memfs.WithMaxStorage(1000)) or memfs.New(memfs.WithOpenHook(myOpenHook))
 func New(opts ...Option) *FS {
 	var fsOpt fsOption
 	for _, opt := range opts {
@@ -336,6 +338,67 @@ func (rootFS *FS) SaveTo(w io.Writer) error {
 	return encoder.Encode(rootFS.dir)
 }
 
+// CompressAndSaveToFile saves the entire filesystem structure to a GOB encoded file after compressing the data using gzip
+func (rootFS *FS) CompressAndSaveToFile(filename string) error {
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	return rootFS.CompressAndSaveTo(f)
+}
+
+// CompressAndSaveTo saves the filesystem structure to any io.Writer in GOB format after compressing the data using gzip
+func (rootFS *FS) CompressAndSaveTo(w io.Writer) error {
+	// Create a gzip writer
+	gw := NewGzipWriter(w)
+	defer gw.Close()
+
+	// Encode and save the filesystem
+	encoder := gob.NewEncoder(gw)
+	return encoder.Encode(rootFS.dir)
+}
+
+// DecompressAndLoadFromFile loads the entire filesystem structure from a GOB encoded file after decompressing the data using gzip
+func DecompressAndLoadFromFile(filename string) (*FS, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	return DecompressAndLoadFrom(f)
+}
+
+// DecompressAndLoadFrom loads the filesystem structure from any io.Reader in GOB format after decompressing the data using gzip
+func DecompressAndLoadFrom(r io.Reader) (*FS, error) {
+	// Create a gzip reader
+	gr, err := gzip.NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	defer gr.Close()
+
+	// Decode and load the filesystem
+	var rootDir Dir
+	decoder := gob.NewDecoder(gr)
+	if err := decoder.Decode(&rootDir); err != nil {
+		return nil, err
+	}
+
+	// Initialize mutexes after loading
+	rootDir.initDir()
+
+	// Create new FS with loaded directory structure
+	fs := &FS{
+		dir:        &rootDir,
+		maxStorage: -1, // Default to unlimited
+	}
+
+	return fs, nil
+}
+
 // init registers types for GOB encoding/decoding
 func init() {
 	gob.Register(&Dir{})
@@ -575,4 +638,35 @@ func (de *dirEntry) Type() fs.FileMode {
 
 func (de *dirEntry) Info() (fs.FileInfo, error) {
 	return de.info, nil
+}
+
+// NewGzipWriter creates a new gzip writer
+func NewGzipWriter(w io.Writer) *GzipWriter {
+	return &GzipWriter{
+		gw: gzip.NewWriter(w),
+		w:  w,
+	}
+}
+
+// GzipWriter is a wrapper around a gzip.Writer that also implements the io.Writer interface
+type GzipWriter struct {
+	gw *gzip.Writer
+	w  io.Writer
+}
+
+// Write writes data to the gzip writer
+func (gz *GzipWriter) Write(p []byte) (int, error) {
+	return gz.gw.Write(p)
+}
+
+// Close closes the gzip writer
+func (gz *GzipWriter) Close() error {
+	err := gz.gw.Close()
+	if err != nil {
+		return err
+	}
+	if closer, ok := gz.w.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
 }
