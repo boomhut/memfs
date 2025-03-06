@@ -518,7 +518,7 @@ func (f *File) Close() error {
 	return nil
 }
 
-type childI interface{}
+type childI any
 
 type fileInfo struct {
 	name    string
@@ -553,7 +553,7 @@ func (fi *fileInfo) IsDir() bool {
 }
 
 // underlying data source (can return nil)
-func (fi *fileInfo) Sys() interface{} {
+func (fi *fileInfo) Sys() any {
 	return nil
 }
 
