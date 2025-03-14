@@ -581,6 +581,192 @@ func (f *File) Close() error {
 	return nil
 }
 
+// Create creates or truncates the named file. If the file already exists,
+// it is truncated. If the file does not exist, it is created with mode 0666.
+// The handle returned is open for writing.
+func (rootFS *FS) Create(path string) (*FileWriter, error) {
+	file, err := rootFS.create(path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reset content for new/truncated file
+	rootFS.mu.Lock()
+	if rootFS.maxStorage > 0 {
+		rootFS.usedStorage -= int64(len(file.Content))
+	}
+	rootFS.mu.Unlock()
+
+	file.Content = []byte{}
+	file.ModTime = time.Now()
+
+	return &FileWriter{
+		file: file,
+		fs:   rootFS,
+	}, nil
+}
+
+// FileWriter is a handle to write to a file in the memory filesystem
+type FileWriter struct {
+	file   *File
+	fs     *FS
+	closed bool
+}
+
+// Write writes data to the file
+func (fw *FileWriter) Write(p []byte) (n int, err error) {
+	if fw.closed {
+		return 0, fs.ErrClosed
+	}
+
+	fw.fs.mu.Lock()
+	defer fw.fs.mu.Unlock()
+
+	// Check if the write would exceed the maximum storage limit
+	if fw.fs.maxStorage > 0 {
+		// Only count the actual new bytes being added
+		newSize := fw.fs.usedStorage + int64(len(p))
+		if newSize > fw.fs.maxStorage {
+			return 0, fmt.Errorf("storage limit exceeded: %w", fs.ErrInvalid)
+		}
+		fw.fs.usedStorage += int64(len(p))
+	}
+
+	fw.file.Content = append(fw.file.Content, p...)
+	fw.file.ModTime = time.Now()
+	return len(p), nil
+}
+
+// Close closes the file writer
+func (fw *FileWriter) Close() error {
+	if fw.closed {
+		return fs.ErrClosed
+	}
+	fw.closed = true
+
+	// Update the reader in case the file is also open for reading
+	fw.file.reader = bytes.NewReader(fw.file.Content)
+	return nil
+}
+
+// OpenFile opens a file with specified flag and permission
+// The flag values are similar to os.OpenFile
+func (rootFS *FS) OpenFile(path string, flag int, perm os.FileMode) (interface{}, error) {
+	// First, check if path is valid
+	if !fs.ValidPath(path) {
+		return nil, fmt.Errorf("invalid path: %s: %w", path, fs.ErrInvalid)
+	}
+
+	// Handle creating a new file
+	if flag&os.O_CREATE != 0 {
+		// Try to get the file first
+		child, err := rootFS.get(path)
+
+		// File doesn't exist
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				// Create new file
+				file, err := rootFS.create(path)
+				if err != nil {
+					return nil, err
+				}
+
+				rootFS.mu.Lock()
+				if rootFS.maxStorage > 0 {
+					rootFS.usedStorage -= int64(len(file.Content))
+				}
+				file.Content = []byte{}
+				file.ModTime = time.Now()
+				rootFS.mu.Unlock()
+
+				if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
+					return &FileWriter{
+						file: file,
+						fs:   rootFS,
+					}, nil
+				} else {
+					// Create but only for reading (unusual case)
+					file.reader = bytes.NewReader(file.Content)
+					return file, nil
+				}
+			}
+			return nil, err
+		}
+
+		// File exists
+		file, isFile := child.(*File)
+		if !isFile {
+			return nil, fmt.Errorf("path is a directory: %s: %w", path, fs.ErrInvalid)
+		}
+
+		if flag&os.O_TRUNC != 0 && (flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0) {
+			// Truncate the file
+			rootFS.mu.Lock()
+			if rootFS.maxStorage > 0 {
+				rootFS.usedStorage -= int64(len(file.Content))
+			}
+			file.Content = []byte{}
+			file.ModTime = time.Now()
+			rootFS.mu.Unlock()
+		}
+
+		if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
+			return &FileWriter{
+				file: file,
+				fs:   rootFS,
+			}, nil
+		} else {
+			// Open for reading only
+			file.reader = bytes.NewReader(file.Content)
+			handle := &File{
+				Name:    file.Name,
+				Perm:    file.Perm,
+				Content: file.Content,
+				reader:  file.reader,
+				ModTime: file.ModTime,
+			}
+			return handle, nil
+		}
+	}
+
+	// Handle reading an existing file without creation
+	if flag == os.O_RDONLY {
+		return rootFS.Open(path)
+	}
+
+	// Handle existing file with write permissions
+	child, err := rootFS.get(path)
+	if err != nil {
+		return nil, err
+	}
+
+	file, isFile := child.(*File)
+	if !isFile {
+		return nil, fmt.Errorf("path is a directory: %s: %w", path, fs.ErrInvalid)
+	}
+
+	if flag&os.O_TRUNC != 0 && (flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0) {
+		// Truncate the file
+		rootFS.mu.Lock()
+		if rootFS.maxStorage > 0 {
+			rootFS.usedStorage -= int64(len(file.Content))
+		}
+		file.Content = []byte{}
+		file.ModTime = time.Now()
+		rootFS.mu.Unlock()
+	}
+
+	if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
+		return &FileWriter{
+			file: file,
+			fs:   rootFS,
+		}, nil
+	}
+
+	// Default to opening for reading
+	return rootFS.Open(path)
+}
+
 type childI any
 
 type fileInfo struct {

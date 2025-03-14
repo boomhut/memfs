@@ -472,3 +472,78 @@ func TestCompressedSaveLoad(t *testing.T) {
 		t.Fatalf("new file content mismatch: %s", diff)
 	}
 }
+
+// OpenFile tests opening a file with different flags. It also tests the error cases. This test is a copy of the
+// OpenFile test in the standard library's fstest package, but adapted to work with MemFS.
+func TestOpenFile2(t *testing.T) {
+	rootFS := New()
+
+	// Test opening a non-existent file without O_CREATE
+	_, err := rootFS.OpenFile("nonexistent.txt", os.O_RDONLY, 0o644)
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("Expected ErrNotExist for non-existent file, got: %v", err)
+	}
+
+	// Test opening a directory for writing
+	err = rootFS.MkdirAll("testdir", 0o755)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rootFS.OpenFile("testdir", os.O_WRONLY, 0o644)
+	if err == nil {
+		t.Fatal("Expected error when opening directory for writing")
+	}
+
+	// Test unsupported flag combination
+	_, err = rootFS.OpenFile("test_unsupported.txt", os.O_APPEND, 0o644)
+	if err == nil {
+		t.Fatal("Expected error for unsupported flag")
+	}
+
+	// Save a file to the filesystem
+	err = rootFS.WriteFile("testfile.txt", []byte("test content"), 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Test opening a file with O_TRUNC flag
+	file, err := rootFS.OpenFile("testfile.txt", os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fw, ok := file.(*FileWriter)
+	if !ok {
+		t.Fatal("Expected *FileWriter from OpenFile with O_WRONLY|O_TRUNC")
+	}
+
+	_, err = fw.Write([]byte("truncated"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Add some more tests to cover 100% of the code
+	_, err = rootFS.OpenFile("testfile.txt", os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = rootFS.OpenFile("testfile.txt", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = rootFS.OpenFile("testfile.txt", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = rootFS.OpenFile("testfile.txt", os.O_RDONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+}

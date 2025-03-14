@@ -42,7 +42,8 @@ func (o *maxStorageOption) setOption(fsOpt *fsOption) {
 	fsOpt.maxStorage = o.size
 }
 
-// WithMaxStorage returns an Option that sets the maximum storage space for the MemFS.
+// WithMaxStorage returns an Option that sets the maximum storage space (in bytes) for the MemFS instance.
+// If the total size of all files in the MemFS exceeds this limit, an error will be returned when trying to write new files.
 func WithMaxStorage(size int64) Option {
 	return &maxStorageOption{
 		size: size,
