@@ -767,6 +767,159 @@ func (rootFS *FS) OpenFile(path string, flag int, perm os.FileMode) (interface{}
 	return rootFS.Open(path)
 }
 
+// Remove deletes a file or empty directory from the filesystem.
+// If the path refers to a non-empty directory, an error is returned.
+func (rootFS *FS) Remove(path string) error {
+	if !fs.ValidPath(path) {
+		return fmt.Errorf("invalid path: %s: %w", path, fs.ErrInvalid)
+	}
+
+	if path == "." {
+		return fmt.Errorf("cannot remove root directory: %w", fs.ErrInvalid)
+	}
+
+	dirPart, filePart := syspath.Split(path)
+	dirPart = strings.TrimSuffix(dirPart, "/")
+
+	dir, err := rootFS.getDir(dirPart)
+	if err != nil {
+		return err
+	}
+
+	dir.mu.Lock()
+	defer dir.mu.Unlock()
+
+	child, exists := dir.Children[filePart]
+	if !exists {
+		return fmt.Errorf("no such file or directory: %s: %w", path, fs.ErrNotExist)
+	}
+
+	// If it's a directory, check if it's empty
+	if childDir, ok := child.(*Dir); ok {
+		childDir.mu.Lock()
+		isEmpty := len(childDir.Children) == 0
+		childDir.mu.Unlock()
+
+		if !isEmpty {
+			return fmt.Errorf("directory not empty: %s", path)
+		}
+	}
+
+	// If it's a file, adjust the storage usage
+	if file, ok := child.(*File); ok {
+		rootFS.mu.Lock()
+		if rootFS.maxStorage > 0 {
+			rootFS.usedStorage -= int64(len(file.Content))
+		}
+		rootFS.mu.Unlock()
+	}
+
+	// Remove the entry
+	delete(dir.Children, filePart)
+	return nil
+}
+
+// RemoveAll removes path and any children it contains.
+// It removes everything it can but returns the first error it encounters.
+// If the path does not exist, RemoveAll returns nil (no error).
+func (rootFS *FS) RemoveAll(path string) error {
+	if !fs.ValidPath(path) {
+		return fmt.Errorf("invalid path: %s: %w", path, fs.ErrInvalid)
+	}
+
+	if path == "." {
+		// Special case: clear entire filesystem but keep root dir
+		rootFS.dir.mu.Lock()
+
+		// Adjust storage counters
+		if rootFS.maxStorage > 0 {
+			rootFS.mu.Lock()
+			rootFS.usedStorage = 0
+			rootFS.mu.Unlock()
+		}
+
+		// Clear all children
+		rootFS.dir.Children = make(map[string]childI)
+		rootFS.dir.mu.Unlock()
+		return nil
+	}
+
+	dirPart, filePart := syspath.Split(path)
+	dirPart = strings.TrimSuffix(dirPart, "/")
+
+	dir, err := rootFS.getDir(dirPart)
+	if err != nil {
+		// If the parent directory doesn't exist, there's nothing to remove
+		// which is not an error for RemoveAll (matches os.RemoveAll behavior)
+		return nil
+	}
+
+	dir.mu.Lock()
+	defer dir.mu.Unlock()
+
+	child, exists := dir.Children[filePart]
+	if !exists {
+		// Path doesn't exist, which is not an error for RemoveAll
+		return nil
+	}
+
+	// If it's a file, adjust the storage usage and remove it
+	if file, ok := child.(*File); ok {
+		rootFS.mu.Lock()
+		if rootFS.maxStorage > 0 {
+			rootFS.usedStorage -= int64(len(file.Content))
+		}
+		rootFS.mu.Unlock()
+		delete(dir.Children, filePart)
+		return nil
+	}
+
+	// If it's a directory, we need to calculate storage used by all files in it recursively
+	if childDir, ok := child.(*Dir); ok {
+		// Calculate storage used by the directory and its contents
+		if rootFS.maxStorage > 0 {
+			rootFS.removeStorageUsed(childDir)
+		}
+
+		// Remove the directory entry
+		delete(dir.Children, filePart)
+	}
+
+	return nil
+}
+
+// removeStorageUsed recursively calculates and removes the storage used by a directory
+func (rootFS *FS) removeStorageUsed(dir *Dir) {
+	// First collect all the files and directories that need to be processed
+	var fileSizes []int
+	var subdirs []*Dir
+
+	// Lock the directory to safely iterate through its children
+	dir.mu.Lock()
+	for _, child := range dir.Children {
+		if file, ok := child.(*File); ok {
+			fileSizes = append(fileSizes, len(file.Content))
+		} else if childDir, ok := child.(*Dir); ok {
+			subdirs = append(subdirs, childDir)
+		}
+	}
+	dir.mu.Unlock()
+
+	// Process subdirectories recursively
+	for _, subdir := range subdirs {
+		rootFS.removeStorageUsed(subdir)
+	}
+
+	// Update the storage usage for files in this directory
+	if len(fileSizes) > 0 {
+		rootFS.mu.Lock()
+		for _, size := range fileSizes {
+			rootFS.usedStorage -= int64(size)
+		}
+		rootFS.mu.Unlock()
+	}
+}
+
 type childI any
 
 type fileInfo struct {
