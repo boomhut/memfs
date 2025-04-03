@@ -920,6 +920,14 @@ func (rootFS *FS) removeStorageUsed(dir *Dir) {
 	}
 }
 
+// UsedStorage returns the current amount of storage space (in bytes) being used by the filesystem.
+// If storage tracking is not enabled (maxStorage <= 0), this will still return the actual space used.
+func (rootFS *FS) UsedStorage() int64 {
+	rootFS.mu.Lock()
+	defer rootFS.mu.Unlock()
+	return rootFS.usedStorage
+}
+
 type childI any
 
 type fileInfo struct {
