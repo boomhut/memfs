@@ -5,8 +5,9 @@ type Option interface {
 }
 
 type fsOption struct {
-	openHook   func(path string, existingContent []byte, origErr error) ([]byte, error)
-	maxStorage int64
+	openHook      func(path string, existingContent []byte, origErr error) ([]byte, error)
+	maxStorage    int64
+	encryptionKey []byte
 }
 
 type openHookOption struct {
@@ -47,5 +48,30 @@ func (o *maxStorageOption) setOption(fsOpt *fsOption) {
 func WithMaxStorage(size int64) Option {
 	return &maxStorageOption{
 		size: size,
+	}
+}
+
+type encryptionOption struct {
+	key []byte
+}
+
+func (o *encryptionOption) setOption(fsOpt *fsOption) {
+	fsOpt.encryptionKey = o.key
+}
+
+// WithEncryption returns an Option that enables encryption at rest for all file data stored in the MemFS.
+// The encryption key can be of any length and will be hashed to 32 bytes for AES-256-GCM encryption.
+// All file contents will be automatically encrypted when written and decrypted when read.
+//
+// Example:
+//
+//	key := []byte("my-secret-encryption-key")
+//	fs := memfs.New(memfs.WithEncryption(key))
+//
+// Note: The encryption key is not stored with the filesystem. You must provide the same key
+// when loading a saved encrypted filesystem, otherwise decryption will fail.
+func WithEncryption(key []byte) Option {
+	return &encryptionOption{
+		key: key,
 	}
 }

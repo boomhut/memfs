@@ -23,26 +23,48 @@ type FS struct {
 	maxStorage  int64      // maximum storage limit in bytes
 	usedStorage int64      // current storage usage in bytes
 	mu          sync.Mutex // mutex for storage tracking
+	encryptor   *encryptor // encryptor for data at rest encryption
 }
 
-// New creates a new in-memory FileSystem. It accepts options to customize the filesystem. The options are: openHook and maxStorage.
-// Set like this: memfs.New(memfs.WithMaxStorage(1000)) or memfs.New(memfs.WithOpenHook(myOpenHook))
+// New creates a new in-memory FileSystem. It accepts options to customize the filesystem. The options are: openHook, maxStorage, and encryption.
+// Set like this: memfs.New(memfs.WithMaxStorage(1000)), memfs.New(memfs.WithOpenHook(myOpenHook)), or memfs.New(memfs.WithEncryption(key))
 func New(opts ...Option) *FS {
 	var fsOpt fsOption
 	for _, opt := range opts {
 		opt.setOption(&fsOpt)
 	}
+
+	// Initialize encryptor if encryption key is provided
+	enc, err := newEncryptor(fsOpt.encryptionKey)
+	if err != nil {
+		// If encryptor initialization fails, create a disabled encryptor
+		enc = &encryptor{enable: false}
+	}
+
 	fs := FS{
 		dir: &Dir{
 			Children: make(map[string]childI),
 		},
 		maxStorage: -1, // -1 means unlimited
+		encryptor:  enc,
 	}
 
 	fs.openHook = fsOpt.openHook
 	fs.maxStorage = fsOpt.maxStorage
 
 	return &fs
+}
+
+// SetEncryptionKey sets or updates the encryption key for the filesystem.
+// This is useful when loading an encrypted filesystem from disk - you need to
+// provide the same key that was used when the data was encrypted.
+func (rootFS *FS) SetEncryptionKey(key []byte) error {
+	enc, err := newEncryptor(key)
+	if err != nil {
+		return err
+	}
+	rootFS.encryptor = enc
+	return nil
 }
 
 // MkdirAll creates a directory named path,
@@ -212,9 +234,19 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 		return fmt.Errorf("invalid path: %s: %w", path, fs.ErrInvalid)
 	}
 
+	// Encrypt data before storing if encryption is enabled
+	encryptedData := data
+	if rootFS.encryptor != nil {
+		var err error
+		encryptedData, err = rootFS.encryptor.encrypt(data)
+		if err != nil {
+			return fmt.Errorf("encryption failed: %w", err)
+		}
+	}
+
 	rootFS.mu.Lock()
 	if rootFS.maxStorage > 0 {
-		newSize := rootFS.usedStorage + int64(len(data))
+		newSize := rootFS.usedStorage + int64(len(encryptedData))
 		if newSize > rootFS.maxStorage {
 			rootFS.mu.Unlock()
 			return fmt.Errorf("storage limit exceeded: %w", fs.ErrInvalid)
@@ -234,13 +266,13 @@ func (rootFS *FS) WriteFile(path string, data []byte, perm os.FileMode) error {
 
 	rootFS.mu.Lock()
 	if rootFS.maxStorage > 0 {
-		// Subtract old file size and add new file size
+		// Subtract old file size and add new file size (using encrypted size)
 		rootFS.usedStorage -= int64(len(f.Content))
-		rootFS.usedStorage += int64(len(data))
+		rootFS.usedStorage += int64(len(encryptedData))
 	}
 	rootFS.mu.Unlock()
 
-	f.Content = data
+	f.Content = encryptedData
 	f.Perm = perm
 	return nil
 }
@@ -264,6 +296,7 @@ func (rootFS *FS) Open(name string) (fs.File, error) {
 				return child, err
 			}
 
+			// Note: exitingContent is already decrypted by open() method
 			exitingContent, err = io.ReadAll(child)
 			if err != nil {
 				return nil, err
@@ -294,11 +327,21 @@ func (rootFS *FS) open(name string) (fs.File, error) {
 
 	switch cc := child.(type) {
 	case *File:
+		// Decrypt content if encryption is enabled
+		content := cc.Content
+		if rootFS.encryptor != nil && rootFS.encryptor.enable {
+			decryptedContent, err := rootFS.encryptor.decrypt(cc.Content)
+			if err != nil {
+				return nil, fmt.Errorf("decryption failed: %w", err)
+			}
+			content = decryptedContent
+		}
+
 		handle := &File{
 			Name:    cc.Name,
 			Perm:    cc.Perm,
-			Content: cc.Content,
-			reader:  bytes.NewReader(cc.Content),
+			Content: content,
+			reader:  bytes.NewReader(content),
 			ModTime: cc.ModTime,
 		}
 		return handle, nil
@@ -390,10 +433,14 @@ func DecompressAndLoadFrom(r io.Reader) (*FS, error) {
 	// Initialize mutexes after loading
 	rootDir.initDir()
 
+	// Initialize a disabled encryptor (encryption key not persisted)
+	enc := &encryptor{enable: false}
+
 	// Create new FS with loaded directory structure
 	fs := &FS{
 		dir:        &rootDir,
 		maxStorage: -1, // Default to unlimited
+		encryptor:  enc,
 	}
 
 	return fs, nil
@@ -427,10 +474,14 @@ func LoadFrom(r io.Reader) (*FS, error) {
 	// Initialize mutexes after loading
 	rootDir.initDir()
 
+	// Initialize a disabled encryptor (encryption key not persisted)
+	enc := &encryptor{enable: false}
+
 	// Create new FS with loaded directory structure
 	fs := &FS{
 		dir:        &rootDir,
 		maxStorage: -1, // Default to unlimited
+		encryptor:  enc,
 	}
 
 	return fs, nil
@@ -632,6 +683,8 @@ func (fw *FileWriter) Write(p []byte) (n int, err error) {
 		fw.fs.usedStorage += int64(len(p))
 	}
 
+	// Note: For streaming writes, we append plaintext and will encrypt on Close
+	// This is because encryption with AES-GCM needs the complete data
 	fw.file.Content = append(fw.file.Content, p...)
 	fw.file.ModTime = time.Now()
 	return len(p), nil
@@ -643,6 +696,25 @@ func (fw *FileWriter) Close() error {
 		return fs.ErrClosed
 	}
 	fw.closed = true
+
+	// Encrypt the content before finalizing if encryption is enabled
+	if fw.fs.encryptor != nil && fw.fs.encryptor.enable {
+		plaintext := fw.file.Content
+		encryptedData, err := fw.fs.encryptor.encrypt(plaintext)
+		if err != nil {
+			return fmt.Errorf("encryption failed on close: %w", err)
+		}
+
+		// Update storage accounting for the difference in size
+		fw.fs.mu.Lock()
+		if fw.fs.maxStorage > 0 {
+			sizeDiff := int64(len(encryptedData)) - int64(len(plaintext))
+			fw.fs.usedStorage += sizeDiff
+		}
+		fw.fs.mu.Unlock()
+
+		fw.file.Content = encryptedData
+	}
 
 	// Update the reader in case the file is also open for reading
 	fw.file.reader = bytes.NewReader(fw.file.Content)
@@ -711,18 +783,34 @@ func (rootFS *FS) OpenFile(path string, flag int, perm os.FileMode) (interface{}
 		}
 
 		if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
+			// For write mode, we need to decrypt first if file has content
+			if rootFS.encryptor != nil && rootFS.encryptor.enable && len(file.Content) > 0 {
+				decryptedContent, err := rootFS.encryptor.decrypt(file.Content)
+				if err != nil {
+					return nil, fmt.Errorf("decryption failed: %w", err)
+				}
+				// Update to decrypted content for write operations
+				file.Content = decryptedContent
+			}
 			return &FileWriter{
 				file: file,
 				fs:   rootFS,
 			}, nil
 		} else {
-			// Open for reading only
-			file.reader = bytes.NewReader(file.Content)
+			// Open for reading only - decrypt the content
+			content := file.Content
+			if rootFS.encryptor != nil && rootFS.encryptor.enable && len(content) > 0 {
+				decryptedContent, err := rootFS.encryptor.decrypt(content)
+				if err != nil {
+					return nil, fmt.Errorf("decryption failed: %w", err)
+				}
+				content = decryptedContent
+			}
 			handle := &File{
 				Name:    file.Name,
 				Perm:    file.Perm,
-				Content: file.Content,
-				reader:  file.reader,
+				Content: content,
+				reader:  bytes.NewReader(content),
 				ModTime: file.ModTime,
 			}
 			return handle, nil
